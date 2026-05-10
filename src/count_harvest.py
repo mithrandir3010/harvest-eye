@@ -8,28 +8,23 @@ import sys
 from pathlib import Path
 
 import cv2
-import matplotlib.pyplot as plt
+import numpy as np
 from ultralytics import YOLO
 
 from utils import check_gpu, resolve_device, setup_dirs
 
 logger = logging.getLogger(__name__)
 
+# BGR (OpenCV)
+_COLOR_HARVEST_BGR = (0, 220, 0)
+_COLOR_WAIT_BGR = (0, 0, 220)
+_COLOR_RING_BGR = (255, 255, 255)
+_CIRCLE_RADIUS_PX = 8
+
 
 def _project_root() -> Path:
     """Proje kök dizini."""
     return Path(__file__).resolve().parent.parent
-
-
-def _latest_saved_image(run_dir: Path) -> Path | None:
-    """``predict(save=True)`` çıktı klasöründeki en yeni görüntüyü döndürür."""
-    patterns = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
-    candidates: list[Path] = []
-    for pat in patterns:
-        candidates.extend(run_dir.glob(pat))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
 def count_by_cap_width(
@@ -67,8 +62,60 @@ def count_by_cap_width(
     return n, harvest, wait
 
 
+def render_harvest_preview(
+    img_bgr: np.ndarray,
+    r: object,
+    px_to_mm: float,
+    harvest_mm: float,
+    total: int,
+    harvest: int,
+    wait: int,
+) -> np.ndarray:
+    """
+    Orijinal BGR görüntü üzerine merkez daireleri ve üst başlığı çizer (bbox yok).
+
+    Args:
+        img_bgr: Kaynak görüntü (BGR).
+        ``r``: Ultralytics sonuç (kutular).
+        px_to_mm: Piksel → mm ölçeği.
+        harvest_mm: Hasat eşiği (mm).
+        total, harvest, wait: Başlıkta gösterilecek sayılar.
+
+    Returns:
+        Başlık şeridi eklenmiş BGR görüntü.
+    """
+    out = img_bgr.copy()
+    boxes = getattr(r, "boxes", None)
+    if boxes is not None and len(boxes) > 0:
+        xywh = boxes.xywh
+        if hasattr(xywh, "cpu"):
+            xywh = xywh.cpu().numpy()
+        for i in range(len(boxes)):
+            cx = int(round(float(xywh[i, 0])))
+            cy = int(round(float(xywh[i, 1])))
+            w_px = float(xywh[i, 2])
+            cap_mm = w_px * px_to_mm
+            fill = _COLOR_HARVEST_BGR if cap_mm >= harvest_mm else _COLOR_WAIT_BGR
+            center = (cx, cy)
+            cv2.circle(out, center, _CIRCLE_RADIUS_PX, fill, thickness=-1)
+            cv2.circle(out, center, _CIRCLE_RADIUS_PX, _COLOR_RING_BGR, thickness=1)
+
+    title = f"Toplam: {total} | Hasat: {harvest} (yesil) | Bekle: {wait} (kirmizi)"
+    header_h = 48
+    h, w = out.shape[:2]
+    header = np.full((header_h, w, 3), 32, dtype=np.uint8)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = min(0.55, (w * 0.85) / max(cv2.getTextSize(title, font, 0.65, 2)[0][0], 1))
+    thickness = 2
+    (tw, th), _ = cv2.getTextSize(title, font, scale, thickness)
+    tx = max(8, (w - tw) // 2)
+    ty = (header_h + th) // 2
+    cv2.putText(header, title, (tx, ty), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    return np.vstack([header, out])
+
+
 def main() -> None:
-    """CLI: tahmin, sayım ve (isteğe bağlı) matplotlib ile önizleme."""
+    """CLI: tahmin, sayım ve OpenCV ile önizleme."""
     root = _project_root()
     parser = argparse.ArgumentParser(
         description="Mantar tespiti + kap genişliğine göre hasat/bekle sayımı",
@@ -96,7 +143,7 @@ def main() -> None:
     parser.add_argument(
         "--no-show",
         action="store_true",
-        help="Matplotlib penceresini açma (sunucu / headless)",
+        help="Pencere açma; yalnızca PNG kaydet (headless)",
     )
     args = parser.parse_args()
 
@@ -122,15 +169,15 @@ def main() -> None:
         check_gpu()
 
     project_dir = (root / args.project).resolve()
+    run_out = project_dir / args.name
+    run_out.mkdir(parents=True, exist_ok=True)
+
     model = YOLO(str(weights))
     results = model.predict(
         source=str(src),
         conf=args.conf,
         iou=args.iou,
-        save=True,
-        project=str(project_dir),
-        name=args.name,
-        line_width=args.line_width,
+        save=False,
         device=device,
         verbose=False,
     )
@@ -142,33 +189,26 @@ def main() -> None:
     logger.info("Hasat edilecek (≥%.1f mm): %d", args.harvest_mm, harvest)
     logger.info("Bekleyecek      (<%.1f mm): %d", args.harvest_mm, wait)
 
-    run_out = project_dir / args.name
-    pred_path = _latest_saved_image(run_out)
-    if pred_path is None:
-        logger.warning("Kaydedilen tahmin görüntüsü bulunamadı: %s", run_out)
-        return
-
-    img_bgr = cv2.imread(str(pred_path))
+    img_bgr = cv2.imread(str(src))
     if img_bgr is None:
-        logger.error("Görüntü okunamadı: %s", pred_path)
+        logger.error("Görüntü okunamadı: %s", src)
         sys.exit(1)
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-    if args.no_show:
-        out_png = run_out / "count_preview.png"
-        plt.figure(figsize=(14, 10))
-        plt.imshow(img_rgb)
-        plt.axis("off")
-        plt.title(f"Toplam: {total} mantar | Hasat: {harvest} | Bekle: {wait}")
-        plt.savefig(out_png, bbox_inches="tight", dpi=120)
-        plt.close()
-        logger.info("Önizleme kaydedildi: %s", out_png)
-    else:
-        plt.figure(figsize=(14, 10))
-        plt.imshow(img_rgb)
-        plt.axis("off")
-        plt.title(f"Toplam: {total} mantar | Hasat: {harvest} | Bekle: {wait}")
-        plt.show()
+    preview = render_harvest_preview(
+        img_bgr, r, args.px_to_mm, args.harvest_mm, total, harvest, wait
+    )
+    out_png = run_out / "count_preview.png"
+    cv2.imwrite(str(out_png), preview)
+    logger.info("Önizleme kaydedildi: %s", out_png)
+
+    if not args.no_show:
+        h_img, w_img = img_bgr.shape[:2]
+        cv2.namedWindow("Harvest Eye", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Harvest Eye", w_img, h_img)
+        cv2.imshow("Harvest Eye", preview)
+        logger.info("Çıkmak için pencerede bir tuşa basın.")
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
