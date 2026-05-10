@@ -1,0 +1,11 @@
+data/raw/
+runs/
+models/
+__pycache__/
+*.pyc
+.env
+*.pt
+*.onnx
+*.cache
+
+.venv/
