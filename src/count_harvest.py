@@ -1,9 +1,10 @@
-"""YOLO tespiti + kutu genişliğine göre hasat / bekle sınıflandırması ve görselleştirme."""
+"""YOLO tespiti + şekil analizi ile hasat / bekle sınıflandırması ve görselleştirme."""
 
 from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 from pathlib import Path
 
@@ -33,18 +34,87 @@ def _is_video_source(path: Path) -> bool:
     return path.suffix.lower() in _VIDEO_SUFFIXES
 
 
-def count_by_cap_width(
+def _compute_circularity(crop_bgr: np.ndarray) -> float:
+    """
+    OTSU eşik + en büyük kontur üzerinden dairesellik (4π alan / çevre²) döndürür.
+
+    Args:
+        crop_bgr: BGR kırpım; boş veya çok küçükse 1.0 (HAM varsayımı).
+
+    Returns:
+        ``0..1`` aralığında dairesellik veya geçersiz durumda ``1.0``.
+    """
+    if crop_bgr.size == 0 or crop_bgr.shape[0] < 2 or crop_bgr.shape[1] < 2:
+        return 1.0
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 1.0
+    cnt = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(cnt))
+    peri = float(cv2.arcLength(cnt, True))
+    if peri < 1e-6:
+        return 1.0
+    return (4.0 * math.pi * area) / (peri * peri)
+
+
+def _box_is_harvest(
+    img_bgr: np.ndarray,
+    xyxy_row: np.ndarray,
+    circularity_thresh: float,
+    aspect_thresh: float,
+) -> bool:
+    """
+    Kırpım + bbox en-boy oranına göre HASAT (yeşil) mu HAM (kırmızı) mu döner.
+
+    HASAT: dairesellik ``< circularity_thresh`` **veya** en/boy ``> aspect_thresh``.
+    HAM: her iki koşulun tersi.
+
+    Args:
+        img_bgr: Tam kare BGR.
+        xyxy_row: ``[x1, y1, x2, y2]`` piksel.
+        circularity_thresh: Bu değerin altı düzleşmiş sayılır (HASAT sinyali).
+        aspect_thresh: Genişlik / yükseklik bu değeri aşarsa HASAT sinyali.
+
+    Returns:
+        ``True`` ise HASAT (yeşil), ``False`` ise HAM (kırmızı).
+    """
+    x1 = int(round(float(xyxy_row[0])))
+    y1 = int(round(float(xyxy_row[1])))
+    x2 = int(round(float(xyxy_row[2])))
+    y2 = int(round(float(xyxy_row[3])))
+    h_img, w_img = img_bgr.shape[:2]
+    x1 = max(0, min(x1, w_img - 1))
+    y1 = max(0, min(y1, h_img - 1))
+    x2 = max(0, min(x2, w_img))
+    y2 = max(0, min(y2, h_img))
+    if x2 <= x1 or y2 <= y1:
+        return False
+    crop = img_bgr[y1:y2, x1:x2]
+    w_box = float(x2 - x1)
+    h_box = float(max(1, y2 - y1))
+    aspect = w_box / h_box
+    circ = _compute_circularity(crop)
+    circ_harvest = circ < circularity_thresh
+    aspect_harvest = aspect > aspect_thresh
+    return circ_harvest or aspect_harvest
+
+
+def count_by_shape(
     r: object,
-    px_to_mm: float,
-    harvest_mm: float,
+    img_bgr: np.ndarray,
+    circularity_thresh: float,
+    aspect_thresh: float,
 ) -> tuple[int, int, int]:
     """
-    Kutu genişliğine (xywh ``w``) göre hasat ve bekle sayımlarını üretir.
+    Şekil analizine göre hasat / bekle sayımlarını üretir.
 
     Args:
         ``r``: Ultralytics ``Results`` (tek görüntü).
-        px_to_mm: Piksel başına milimetre (kalibrasyon).
-        harvest_mm: Bu genişlik ve üzeri hasat kabul edilir.
+        img_bgr: Tespitin yapıldığı BGR görüntüsü (kırpım için).
+        circularity_thresh: Düşük dairesellik HASAT eşiği.
+        aspect_thresh: Büyük en/boy HASAT eşiği.
 
     Returns:
         ``(toplam_kutu, hasat_sayısı, bekle_sayısı)``
@@ -52,16 +122,14 @@ def count_by_cap_width(
     boxes = getattr(r, "boxes", None)
     if boxes is None or len(boxes) == 0:
         return 0, 0, 0
-    xywh = boxes.xywh
-    if hasattr(xywh, "cpu"):
-        xywh = xywh.cpu().numpy()
-    n = len(boxes)
+    xyxy = boxes.xyxy
+    if hasattr(xyxy, "cpu"):
+        xyxy = xyxy.cpu().numpy()
+    n = len(xyxy)
     harvest = 0
     wait = 0
     for i in range(n):
-        w_px = float(xywh[i, 2])
-        cap_mm = w_px * px_to_mm
-        if cap_mm >= harvest_mm:
+        if _box_is_harvest(img_bgr, xyxy[i], circularity_thresh, aspect_thresh):
             harvest += 1
         else:
             wait += 1
@@ -71,8 +139,8 @@ def count_by_cap_width(
 def render_harvest_preview(
     img_bgr: np.ndarray,
     r: object,
-    px_to_mm: float,
-    harvest_mm: float,
+    circularity_thresh: float,
+    aspect_thresh: float,
     total: int,
     harvest: int,
     wait: int,
@@ -84,8 +152,7 @@ def render_harvest_preview(
     Args:
         img_bgr: Kaynak görüntü (BGR).
         ``r``: Ultralytics sonuç (kutular).
-        px_to_mm: Piksel → mm ölçeği.
-        harvest_mm: Hasat eşiği (mm).
+        circularity_thresh, aspect_thresh: Şekil eşikleri.
         total, harvest, wait: Başlıkta gösterilecek sayılar.
         frame_idx: Verilmişse başlığa ``Kare: X |`` eklenir (video modu).
 
@@ -95,15 +162,19 @@ def render_harvest_preview(
     out = img_bgr.copy()
     boxes = getattr(r, "boxes", None)
     if boxes is not None and len(boxes) > 0:
-        xywh = boxes.xywh
-        if hasattr(xywh, "cpu"):
-            xywh = xywh.cpu().numpy()
-        for i in range(len(boxes)):
-            cx = int(round(float(xywh[i, 0])))
-            cy = int(round(float(xywh[i, 1])))
-            w_px = float(xywh[i, 2])
-            cap_mm = w_px * px_to_mm
-            fill = _COLOR_HARVEST_BGR if cap_mm >= harvest_mm else _COLOR_WAIT_BGR
+        xyxy = boxes.xyxy
+        if hasattr(xyxy, "cpu"):
+            xyxy = xyxy.cpu().numpy()
+        for i in range(len(xyxy)):
+            row = xyxy[i]
+            x1 = float(row[0])
+            y1 = float(row[1])
+            x2 = float(row[2])
+            y2 = float(row[3])
+            cx = int(round((x1 + x2) / 2.0))
+            cy = int(round((y1 + y2) / 2.0))
+            is_harv = _box_is_harvest(img_bgr, row, circularity_thresh, aspect_thresh)
+            fill = _COLOR_HARVEST_BGR if is_harv else _COLOR_WAIT_BGR
             center = (cx, cy)
             cv2.circle(out, center, _CIRCLE_RADIUS_PX, fill, thickness=-1)
             cv2.circle(out, center, _CIRCLE_RADIUS_PX, _COLOR_RING_BGR, thickness=1)
@@ -145,8 +216,18 @@ def main() -> None:
     )
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.35)
-    parser.add_argument("--px-to-mm", type=float, default=0.3, help="1 px ≈ kaç mm (kalibre)")
-    parser.add_argument("--harvest-mm", type=float, default=40.0, help="Hasat eşiği (kap genişliği, mm)")
+    parser.add_argument(
+        "--circularity-thresh",
+        type=float,
+        default=0.75,
+        help="Bu dairesellik değerinin altı HASAT sinyali (düzleşmiş)",
+    )
+    parser.add_argument(
+        "--aspect-thresh",
+        type=float,
+        default=1.15,
+        help="En/boy bu değeri aşarsa HASAT sinyali (yatay yayılmış)",
+    )
     parser.add_argument("--project", type=str, default="runs/test")
     parser.add_argument("--name", type=str, default="sayim")
     parser.add_argument("--line-width", type=int, default=1)
@@ -190,56 +271,164 @@ def main() -> None:
         if not cap.isOpened():
             logger.error("Video açılamadı: %s", src)
             sys.exit(1)
-        frame_idx = 0
+        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if n_frames <= 0:
+            n_frames = 2**31 - 1
         last_preview: np.ndarray | None = None
-        if not args.no_show:
-            cv2.namedWindow("Harvest Eye", cv2.WINDOW_NORMAL)
+        writer_mp4: cv2.VideoWriter | None = None
+        writer_avi: cv2.VideoWriter | None = None
+        vid_frames_written: int = 0
+        _video_writers_init_done: bool = False
+
+        def _ensure_video_writers(prv: np.ndarray) -> None:
+            """İlk kare boyutuna göre MP4 (mp4v) ve AVI (XVID) yazıcılarını oluşturur."""
+            nonlocal writer_mp4, writer_avi, _video_writers_init_done
+            if _video_writers_init_done:
+                return
+            fh, fw = prv.shape[:2]
+            fps_raw = cap.get(cv2.CAP_PROP_FPS)
+            fps = float(fps_raw) if fps_raw and fps_raw > 0 else 25.0
+            if fps > 120.0:
+                fps = 25.0
+
+            out_mp4 = (run_out / "output_video.mp4").resolve()
+            out_avi = (run_out / "output_video.avi").resolve()
+            logger.info(f"Video kaydediliyor: {out_mp4}")
+            w_tmp = cv2.VideoWriter(str(out_mp4), cv2.VideoWriter_fourcc(*"mp4v"), fps, (fw, fh))
+            if not w_tmp.isOpened():
+                logger.error("VideoWriter açılamadı!")
+                writer_mp4 = None
+            else:
+                writer_mp4 = w_tmp
+
+            logger.info(f"Video kaydediliyor: {out_avi}")
+            w_tmp2 = cv2.VideoWriter(str(out_avi), cv2.VideoWriter_fourcc(*"XVID"), fps, (fw, fh))
+            if not w_tmp2.isOpened():
+                logger.error("VideoWriter açılamadı!")
+                writer_avi = None
+            else:
+                writer_avi = w_tmp2
+            _video_writers_init_done = True
+
+        def _write_video_output(prv: np.ndarray) -> None:
+            """İşlenmiş kareyi her iki yazıcıya yazar; her 100 karede günlük."""
+            nonlocal vid_frames_written
+            _ensure_video_writers(prv)
+            if writer_mp4 is not None and writer_mp4.isOpened():
+                writer_mp4.write(prv)
+            if writer_avi is not None and writer_avi.isOpened():
+                writer_avi.write(prv)
+            vid_frames_written += 1
+            if vid_frames_written % 100 == 0:
+                logger.info(f"{vid_frames_written} kare yazıldı")
+
+        predict_kw: dict[str, object] = {
+            "conf": args.conf,
+            "iou": args.iou,
+            "save": False,
+            "device": device,
+            "verbose": False,
+        }
+
+        def _infer_frame(frame_bgr: np.ndarray) -> None:
+            """Mevcut kareyi işler; ``last_preview`` ve pencereyi günceller (``--no-show`` değilse)."""
+            nonlocal last_preview
+            frame_idx_disp = max(1, int(cap.get(cv2.CAP_PROP_POS_FRAMES)))
+            for r in model.predict(source=frame_bgr, stream=True, **predict_kw):
+                total, harvest, wait = count_by_shape(
+                    r, frame_bgr, args.circularity_thresh, args.aspect_thresh
+                )
+                preview = render_harvest_preview(
+                    frame_bgr,
+                    r,
+                    args.circularity_thresh,
+                    args.aspect_thresh,
+                    total,
+                    harvest,
+                    wait,
+                    frame_idx=frame_idx_disp,
+                )
+                last_preview = preview
+                _write_video_output(preview)
+                if not args.no_show:
+                    cv2.imshow("Harvest Eye", preview)
+                break
+
         try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                frame_idx += 1
-                stop_display = False
-                for r in model.predict(
-                    source=frame,
-                    stream=True,
-                    conf=args.conf,
-                    iou=args.iou,
-                    save=False,
-                    device=device,
-                    verbose=False,
-                ):
-                    total, harvest, wait = count_by_cap_width(r, args.px_to_mm, args.harvest_mm)
-                    preview = render_harvest_preview(
-                        frame,
-                        r,
-                        args.px_to_mm,
-                        args.harvest_mm,
-                        total,
-                        harvest,
-                        wait,
-                        frame_idx=frame_idx,
-                    )
-                    last_preview = preview
-                    if not args.no_show:
-                        hp, wp = preview.shape[:2]
-                        cv2.resizeWindow("Harvest Eye", wp, hp)
-                        cv2.imshow("Harvest Eye", preview)
-                        if (cv2.waitKey(1) & 0xFF) == 27:
-                            stop_display = True
+            if args.no_show:
+                try:
+                    while True:
+                        ret, frame = cap.read()
+                        if not ret:
                             break
-                if stop_display:
-                    break
-        finally:
-            cap.release()
-            if not args.no_show:
+                        _infer_frame(frame)
+                finally:
+                    cap.release()
+            else:
+                paused = False
+                ended_on_eof = False
+                try:
+                    cv2.namedWindow("Harvest Eye", cv2.WINDOW_NORMAL)
+                    cv2.resizeWindow("Harvest Eye", 1280, 720)
+                    while True:
+                        if not paused:
+                            ret, frame = cap.read()
+                            if not ret:
+                                ended_on_eof = True
+                                break
+                            _infer_frame(frame)
+                        else:
+                            if last_preview is not None:
+                                cv2.imshow("Harvest Eye", last_preview)
+
+                        raw_key = cv2.waitKey(0 if paused else 1)
+                        print(f"key: {raw_key}")
+                        key = raw_key & 0xFF
+                        if key == 27:
+                            ended_on_eof = False
+                            break
+                        if key == 32:
+                            paused = not paused
+                            continue
+                        if key == 83 or key == 3:
+                            next_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                            tgt = min(next_pos + 30, max(0, n_frames - 1))
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
+                            ret, frame = cap.read()
+                            if ret:
+                                _infer_frame(frame)
+                            continue
+                        if key == 81 or key == 2:
+                            next_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                            tgt = max(next_pos - 30, 0)
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
+                            ret, frame = cap.read()
+                            if ret:
+                                _infer_frame(frame)
+                            continue
+                finally:
+                    cap.release()
+
+                if last_preview is not None and ended_on_eof:
+                    cv2.imshow("Harvest Eye", last_preview)
+                    while True:
+                        raw_key = cv2.waitKey(0)
+                        print(f"key: {raw_key}")
+                        key = raw_key & 0xFF
+                        if key == 27:
+                            break
+
                 cv2.destroyAllWindows()
+        finally:
+            if writer_mp4 is not None:
+                writer_mp4.release()
+            if writer_avi is not None:
+                writer_avi.release()
 
         out_png = run_out / "count_preview.png"
         if last_preview is not None:
             cv2.imwrite(str(out_png), last_preview)
-            logger.info("Son kare kaydedildi: %s (toplam %d kare işlendi)", out_png, frame_idx)
+            logger.info("Son kare kaydedildi: %s", out_png)
         else:
             logger.warning("Kaydedilecek kare yok (video boş olabilir).")
         return
@@ -254,19 +443,28 @@ def main() -> None:
     )
 
     r = results[0]
-    total, harvest, wait = count_by_cap_width(r, args.px_to_mm, args.harvest_mm)
-
-    logger.info("Toplam tespit edilen mantar: %d", total)
-    logger.info("Hasat edilecek (≥%.1f mm): %d", args.harvest_mm, harvest)
-    logger.info("Bekleyecek      (<%.1f mm): %d", args.harvest_mm, wait)
 
     img_bgr = cv2.imread(str(src))
     if img_bgr is None:
         logger.error("Görüntü okunamadı: %s", src)
         sys.exit(1)
 
+    total, harvest, wait = count_by_shape(
+        r, img_bgr, args.circularity_thresh, args.aspect_thresh
+    )
+
+    logger.info("Toplam tespit edilen mantar: %d", total)
+    logger.info("Hasat (yesil, sekil): %d", harvest)
+    logger.info("Bekle (kirmizi, sekil): %d", wait)
+
     preview = render_harvest_preview(
-        img_bgr, r, args.px_to_mm, args.harvest_mm, total, harvest, wait
+        img_bgr,
+        r,
+        args.circularity_thresh,
+        args.aspect_thresh,
+        total,
+        harvest,
+        wait,
     )
     out_png = run_out / "count_preview.png"
     cv2.imwrite(str(out_png), preview)
