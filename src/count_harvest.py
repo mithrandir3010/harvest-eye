@@ -20,11 +20,17 @@ _COLOR_HARVEST_BGR = (0, 220, 0)
 _COLOR_WAIT_BGR = (0, 0, 220)
 _COLOR_RING_BGR = (255, 255, 255)
 _CIRCLE_RADIUS_PX = 8
+_VIDEO_SUFFIXES = {".mp4", ".avi", ".mov"}
 
 
 def _project_root() -> Path:
     """Proje kök dizini."""
     return Path(__file__).resolve().parent.parent
+
+
+def _is_video_source(path: Path) -> bool:
+    """``.mp4``, ``.avi``, ``.mov`` için video modu."""
+    return path.suffix.lower() in _VIDEO_SUFFIXES
 
 
 def count_by_cap_width(
@@ -70,6 +76,7 @@ def render_harvest_preview(
     total: int,
     harvest: int,
     wait: int,
+    frame_idx: int | None = None,
 ) -> np.ndarray:
     """
     Orijinal BGR görüntü üzerine merkez daireleri ve üst başlığı çizer (bbox yok).
@@ -80,6 +87,7 @@ def render_harvest_preview(
         px_to_mm: Piksel → mm ölçeği.
         harvest_mm: Hasat eşiği (mm).
         total, harvest, wait: Başlıkta gösterilecek sayılar.
+        frame_idx: Verilmişse başlığa ``Kare: X |`` eklenir (video modu).
 
     Returns:
         Başlık şeridi eklenmiş BGR görüntü.
@@ -100,7 +108,10 @@ def render_harvest_preview(
             cv2.circle(out, center, _CIRCLE_RADIUS_PX, fill, thickness=-1)
             cv2.circle(out, center, _CIRCLE_RADIUS_PX, _COLOR_RING_BGR, thickness=1)
 
-    title = f"Toplam: {total} | Hasat: {harvest} (yesil) | Bekle: {wait} (kirmizi)"
+    if frame_idx is not None:
+        title = f"Kare: {frame_idx} | Toplam: {total} | Hasat: {harvest} (yesil) | Bekle: {wait} (kirmizi)"
+    else:
+        title = f"Toplam: {total} | Hasat: {harvest} (yesil) | Bekle: {wait} (kirmizi)"
     header_h = 48
     h, w = out.shape[:2]
     header = np.full((header_h, w, 3), 32, dtype=np.uint8)
@@ -173,6 +184,66 @@ def main() -> None:
     run_out.mkdir(parents=True, exist_ok=True)
 
     model = YOLO(str(weights))
+
+    if _is_video_source(src):
+        cap = cv2.VideoCapture(str(src))
+        if not cap.isOpened():
+            logger.error("Video açılamadı: %s", src)
+            sys.exit(1)
+        frame_idx = 0
+        last_preview: np.ndarray | None = None
+        if not args.no_show:
+            cv2.namedWindow("Harvest Eye", cv2.WINDOW_NORMAL)
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_idx += 1
+                stop_display = False
+                for r in model.predict(
+                    source=frame,
+                    stream=True,
+                    conf=args.conf,
+                    iou=args.iou,
+                    save=False,
+                    device=device,
+                    verbose=False,
+                ):
+                    total, harvest, wait = count_by_cap_width(r, args.px_to_mm, args.harvest_mm)
+                    preview = render_harvest_preview(
+                        frame,
+                        r,
+                        args.px_to_mm,
+                        args.harvest_mm,
+                        total,
+                        harvest,
+                        wait,
+                        frame_idx=frame_idx,
+                    )
+                    last_preview = preview
+                    if not args.no_show:
+                        hp, wp = preview.shape[:2]
+                        cv2.resizeWindow("Harvest Eye", wp, hp)
+                        cv2.imshow("Harvest Eye", preview)
+                        if (cv2.waitKey(1) & 0xFF) == 27:
+                            stop_display = True
+                            break
+                if stop_display:
+                    break
+        finally:
+            cap.release()
+            if not args.no_show:
+                cv2.destroyAllWindows()
+
+        out_png = run_out / "count_preview.png"
+        if last_preview is not None:
+            cv2.imwrite(str(out_png), last_preview)
+            logger.info("Son kare kaydedildi: %s (toplam %d kare işlendi)", out_png, frame_idx)
+        else:
+            logger.warning("Kaydedilecek kare yok (video boş olabilir).")
+        return
+
     results = model.predict(
         source=str(src),
         conf=args.conf,
