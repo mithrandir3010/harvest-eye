@@ -1,5 +1,47 @@
 # Harvest-Eye / Mantar Hasat Tespiti
 
+## Hızlı Başlangıç
+
+### Gereksinimler
+
+- Python 3.11+
+- NVIDIA GPU (CPU'da da çalışır, yavaş)
+- `models/detection/best.pt` (eğitimden sonra oluşur)
+
+### Kurulum
+
+```powershell
+git clone https://github.com/mithrandir3010/harvest-eye
+cd harvest-eye
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+pip install -r requirements-dev.txt
+```
+
+### Kontrol listesi (ilk kurulum)
+
+- [ ] `.venv/` oluşturuldu ve aktif
+- [ ] `pip install` tamamlandı
+- [ ] `models/detection/best.pt` mevcut (train veya indir)
+- [ ] `mantar.jpg` / `mantar.mp4` yerelde mevcut (git'e alınmaz)
+
+### Çalıştırma
+
+```powershell
+# Görüntü üzerinde test
+python -m harvest_eye.pipeline.video_stream --source mantar.jpg
+
+# Video üzerinde test
+python -m harvest_eye.pipeline.video_stream --source mantar.mp4
+
+# Testler
+pytest tests/ -v
+
+# Model eğitimi
+python src\train_detection.py --model yolov8n --epochs 100
+```
+
 ## Türkçe
 
 **Harvest-Eye**, kültür mantarı görüntülerinde **tespit** (YOLOv8) ve **olgunluk sınıflandırması** (EfficientNet / timm, planlanan) için bir araştırma ve üretim iskeletidir. Windows ve NVIDIA GPU (CUDA 12.1) hedeflenir; CUDA yoksa betikler otomatik olarak CPU’ya düşer.
