@@ -1,0 +1,18 @@
+detection:
+  conf: 0.25
+  iou: 0.35
+  device: auto
+  imgsz: 640
+
+harvest:
+  mode: shape
+  circularity_thresh: 0.75
+  aspect_thresh: 1.15
+  harvest_mm: 40.0
+  px_to_mm: 0.3
+
+projection:
+  enabled: false
+  dot_radius: 8
+  display_width: 1280
+  display_height: 720
