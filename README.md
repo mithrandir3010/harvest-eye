@@ -52,7 +52,7 @@ python src\train_detection.py --model yolov8n --epochs 100
 2. Sanal ortam önerilir:
 
 ```powershell
-cd c:\Users\tommy\Desktop\harvest-eye
+cd harvest-eye
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -115,7 +115,7 @@ python src\inference.py --source path\to\image.jpg
 2. Create a virtual environment and install dependencies:
 
 ```powershell
-cd c:\Users\tommy\Desktop\harvest-eye
+cd harvest-eye
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
